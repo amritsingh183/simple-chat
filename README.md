@@ -63,7 +63,7 @@ it is ready for review.
 
 ## Bonus
 
-* Include a rusty-hook that will ensure that all code is formatted, compiles
+* Include a pre-commit hook that will ensure that all code is formatted, compiles
 without error, and is free of clippy errors.
 * Create a GitHub Action that will launch your chat server and attempt to 
 send a message to the server from the client. Make sure that niether the server
