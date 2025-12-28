@@ -1,0 +1,79 @@
+[workspace]
+resolver = "3"
+members = ["server", "common", "client"]
+
+# Shared workspace configuration
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92.0"
+license = "MIT"
+repository = ""
+
+[workspace.dependencies]
+common = { path = "common" }
+
+tracing = "0.1.41"
+tracing-appender = "0.2.3"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter", "json"] }
+tracing-log = "0.2.0"
+uuid = { version = "1.19", features = ["v4","v7"] }
+crossbeam-channel = "0.5"
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive", "env"] }
+thiserror = "2"
+rustyline = "15"
+stringzilla = ">=4"
+
+[workspace.lints.rust]
+unsafe_code = "warn"
+unsafe_op_in_unsafe_fn = "deny"
+invalid_null_arguments = "deny"
+elided_lifetimes_in_paths = "warn"
+non_snake_case = { level = "allow", priority = 1 }
+
+
+[workspace.lints.clippy]
+missing_panics_doc = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+unimplemented = "deny"
+todo = "deny"
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"
+integer_division = "deny"
+cast_possible_truncation = "deny"
+cast_possible_wrap = "deny"
+cast_sign_loss = "deny"
+cast_precision_loss = "deny"
+mem_forget = "deny"
+large_stack_arrays = "deny"
+fn_to_numeric_cast_any = "deny"
+ptr_as_ptr = "warn"
+ptr_cast_constness = "warn"
+await_holding_lock = "deny"
+await_holding_refcell_ref = "deny"
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+module_name_repetitions = { level = "allow", priority = 1 }
+
+# Shared profiles
+[profile.dev]
+overflow-checks = true
+
+[profile.release]
+panic = "abort"
+overflow-checks = true
+lto = true
+codegen-units = 1
+strip = true
+opt-level = 3
+
+[workspace.metadata.bin]
+cargo-audit = { version = "0.22.0" }
+cargo-outdated = { version = "0.17.0" }
+cargo-udeps = { version = "0.1.56" }
+cargo-deny = { version = "0.18.1" }
