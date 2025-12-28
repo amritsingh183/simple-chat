@@ -1,0 +1,7 @@
+[alias]
+check = "clippy --all-targets --all-features -- -D warnings"
+c = "clippy --all-targets --all-features -- -D warnings"
+audit = ["bin", "cargo-audit"]
+deny = ["bin", "cargo-deny"]
+outdated = ["bin", "cargo-outdated"]
+udeps = ["bin", "cargo-udeps"]

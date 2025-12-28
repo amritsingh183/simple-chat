@@ -1,0 +1,20 @@
+[package]
+name = "common"
+description = "Shared library for chat server and client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "common"
+path = "src/lib.rs"
+
+[dependencies]
+tracing.workspace = true
+tracing-appender.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true
+
+[build-dependencies]
