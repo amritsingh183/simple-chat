@@ -47,34 +47,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn accept_connections(listener: &TcpListener, semaphore: Arc<Semaphore>) {
     loop {
-        let accept_result = listener.accept().await;
-
-        let permit = if let Ok(permit) = semaphore.clone().try_acquire_owned() {
-            permit
+        let permit = if let Ok(p) = semaphore.clone().try_acquire_owned() {
+            p
         } else {
-            warn!("Connection limit reached ({MAX_CONNECTIONS}), new connection may be delayed");
-            if let Ok(permit) = semaphore.clone().acquire_owned().await {
-                permit
-            } else {
+            warn!("Connection limit reached ({MAX_CONNECTIONS}), waiting...");
+            let Ok(p) = semaphore.clone().acquire_owned().await else {
                 error!("Semaphore closed unexpectedly");
                 return;
-            }
+            };
+            p
         };
 
-        match accept_result {
-            Ok((socket, addr)) => {
-                tokio::spawn(async move {
-                    let _permit = permit;
-                    handle_connection(socket, addr).await;
-                });
-            }
-            Err(e) => {
-                error!("Failed to accept connection: {e}");
-
-                drop(permit);
-
-                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-            }
+        // Now accept — we have capacity
+        if let Ok((tcp_stream, sock_addr)) = listener.accept().await {
+            tokio::spawn(async move {
+                let _permit = permit;
+                handle_connection(tcp_stream, sock_addr).await;
+            });
+        } else {
+            error!("Failed to accept connection");
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         }
     }
 }
