@@ -1,31 +1,26 @@
-use std::{
-    sync::{
-        Arc, LazyLock, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
-    thread::{self, JoinHandle},
-    time::Duration,
+use std::sync::{
+    Arc, LazyLock,
+    atomic::{AtomicBool, Ordering},
 };
 
-use common::security;
-use tracing::{info, warn};
+use common::consts;
+use tokio::{sync::Mutex, task::JoinHandle};
+use tracing::info;
 
 use crate::chat::{
-    message,
-    room::{Error as RoomError, MessageQueue, RecvError, get_room},
+    room::{Error as RoomError, MessageQueue, MessageReceiver, OneToMany, OneToOne, RecvError, get_room},
     user::{UserRegistry, get_registry},
 };
 
-const DEFAULT_SEND_TIMEOUT: Duration = Duration::from_millis(100);
-const DEFAULT_RECV_TIMEOUT: Duration = Duration::from_millis(100);
-static BROKER: LazyLock<MessageBroker> = LazyLock::new(|| {
-    let broker = MessageBroker::new();
-    broker.start_dispatcher();
-    broker
-});
+static BROKER: LazyLock<MessageBroker> = LazyLock::new(MessageBroker::new);
 
 pub fn get_broker() -> &'static MessageBroker {
     &BROKER
+}
+
+/// Call this once at startup to begin dispatching messages
+pub async fn start_dispatcher() {
+    BROKER.start_dispatcher().await;
 }
 
 pub struct MessageBroker {
@@ -48,33 +43,34 @@ impl MessageBroker {
     pub const fn registry(&self) -> &UserRegistry {
         self.registry
     }
-    // our use case is broadcase to all
-    pub fn forward_to_room(&self, msg: String) -> Result<(), RoomError> {
-        self.room.send_timeout(msg, DEFAULT_SEND_TIMEOUT)
+
+    // our use case is broadcast to all
+    pub fn forward_to_room(&self, encoded_msg: Vec<u8>) -> Result<(), RoomError> {
+        self.room
+            .send_timeout(OneToOne::from(encoded_msg), consts::BACKBONE_DEFAULT_SEND_TIMEOUT)
     }
-    fn start_dispatcher(&self) {
+
+    async fn start_dispatcher(&self) {
         let receiver = self.room.receiver();
         let registry = self.registry;
         let shutdown_flag = Arc::clone(&self.shutdown_flag);
 
-        let handle = thread::spawn(move || {
+        let handle = tokio::spawn(async move {
             loop {
                 if shutdown_flag.load(Ordering::Relaxed) {
                     info!("Dispatcher received shutdown signal");
                     break;
                 }
 
-                match receiver.recv_timeout(DEFAULT_RECV_TIMEOUT) {
-                    Ok(serialized) => {
-                        if let Some(msg) = message::ChatMessage::deserialize(&serialized) {
-                            let sent = registry.broadcast(&msg.1, Some(&msg.0)).unwrap_or(0);
-                            if sent > 0 {
-                                let safe_username = security::sanitize_for_log(&msg.0.to_string());
-                                info!("Dispatched message from '{}' to {} users", safe_username, sent);
-                            }
-                        } else {
-                            let safe_msg = security::truncate_for_log(&security::sanitize_for_log(&serialized), 100);
-                            warn!("Failed to deserialize message: {safe_msg}");
+                // Use spawn_blocking for the sync crossbeam recv
+                let recv_result = recv_with_timeout(receiver).await;
+
+                match recv_result {
+                    Ok(msg) => {
+                        // Now we can await the async broadcast
+                        let sent = registry.broadcast(&msg, None).await.unwrap_or(0);
+                        if sent > 0 {
+                            info!("Dispatched message to {} users", sent);
                         }
                     }
                     Err(RecvError::Timeout) => {}
@@ -85,11 +81,25 @@ impl MessageBroker {
                 }
             }
 
-            info!("Dispatcher thread stopped");
+            info!("Dispatcher task stopped");
         });
 
-        if let Ok(mut guard) = self.dispatcher_handle.lock() {
-            *guard = Some(handle);
+        let mut guard = self.dispatcher_handle.lock().await;
+        *guard = Some(handle);
+    }
+
+    pub async fn shutdown(&self) {
+        self.shutdown_flag.store(true, Ordering::Relaxed);
+        let handle = self.dispatcher_handle.lock().await.take();
+        if let Some(h) = handle {
+            let _ = h.await;
         }
     }
+}
+
+/// Bridge sync crossbeam recv into async context
+async fn recv_with_timeout(receiver: &'static dyn MessageReceiver) -> Result<OneToMany, RecvError> {
+    tokio::task::spawn_blocking(move || receiver.recv_timeout(consts::BACKBONE_DEFAULT_RECV_TIMEOUT))
+        .await
+        .unwrap_or(Err(RecvError::Disconnected))
 }

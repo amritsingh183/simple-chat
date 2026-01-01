@@ -7,26 +7,29 @@ use std::{
 };
 
 use clap::Parser;
-use common::consts;
+use common::{
+    consts,
+    tcp_message::{ClientMessage, ServerMessage, WireDecode, WireEncode},
+};
 use rustyline::{DefaultEditor, error::ReadlineError};
-use stringzilla::sz;
 use thiserror::Error;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::TcpStream,
     sync::mpsc,
 };
+use tracing::{error, info, warn};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Chat client CLI")]
 struct Args {
-    #[arg(long, env = "CHAT_HOST", default_value = "127.0.0.1")]
+    #[arg(long, env = consts::ENV_CHAT_HOST, default_value = "127.0.0.1")]
     host: String,
 
-    #[arg(long, env = "CHAT_PORT", default_value = "8080")]
+    #[arg(long, env = consts::ENV_CHAT_PORT, default_value = "8080")]
     port: u16,
 
-    #[arg(long, env = "CHAT_USERNAME")]
+    #[arg(long, env = consts::ENV_CHAT_USERNAME,)]
     username: String,
 }
 
@@ -55,6 +58,7 @@ struct ConnectedClient {
 }
 
 struct JoinedClient {
+    username: String,
     shutdown: Arc<AtomicBool>,
 }
 
@@ -96,15 +100,26 @@ impl ConnectedClient {
         ),
         ClientError,
     > {
-        let join_cmd = format!("{}{}\n", consts::CLIENT_JOIN_PREFIX, self.username);
-        self.writer.write_all(join_cmd.as_bytes()).await?;
+        let join_msg = ClientMessage::Join {
+            username: self.username.clone(),
+        };
+        let encoded = join_msg.encode();
+        self.writer.write_all(&encoded).await?;
+        self.writer.write_all(b"\n").await?;
         self.writer.flush().await?;
 
         let mut response = String::new();
         self.reader.read_line(&mut response).await?;
 
-        if response.trim().starts_with(consts::SERVER_ERR_PREFIX.trim()) {
-            return Err(ClientError::ServerError(response.trim().to_string()));
+        // Parse response using new wire protocol
+        match ServerMessage::decode(response.trim().as_bytes()) {
+            Ok(ServerMessage::Ok) => {}
+            Ok(ServerMessage::Err { reason }) => {
+                return Err(ClientError::ServerError(reason));
+            }
+            _ => {
+                return Err(ClientError::ServerError(response.trim().to_string()));
+            }
         }
 
         println!(
@@ -114,6 +129,7 @@ impl ConnectedClient {
         println!("Use arrow keys for history navigation.\n");
 
         let joined = JoinedClient {
+            username: self.username,
             shutdown: Arc::new(AtomicBool::new(false)),
         };
 
@@ -128,55 +144,56 @@ impl JoinedClient {
         mut writer: tokio::net::tcp::OwnedWriteHalf,
     ) -> Result<(), ClientError> {
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<String>(32);
-
         let shutdown_clone = Arc::clone(&self.shutdown);
         let reader_handle = tokio::spawn(async move {
-            read_server_messages(reader, shutdown_clone).await;
+            read_server_messages(&self.username, reader, shutdown_clone).await;
         });
-
         let shutdown_clone = Arc::clone(&self.shutdown);
         let readline_handle = std::thread::spawn(move || {
-            read_user_input(&cmd_tx, &shutdown_clone);
+            read_joined_user_input(&cmd_tx, &shutdown_clone);
         });
-
         while let Some(input) = cmd_rx.recv().await {
             if self.shutdown.load(Ordering::SeqCst) {
                 break;
             }
-
             let trimmed = input.trim();
-
             if trimmed.eq_ignore_ascii_case(consts::CLIENT_LEAVE_CMD) {
-                writer
-                    .write_all(format!("{}\n", consts::CLIENT_LEAVE_PREFIX).as_bytes())
-                    .await?;
+                let encoded = ClientMessage::Leave.encode();
+                writer.write_all(&encoded).await?;
+                writer.write_all(b"\n").await?;
                 writer.flush().await?;
                 println!("Goodbye!");
                 break;
             } else if let Some(msg) = trimmed
-                .strip_prefix("send ")
+                .strip_prefix(consts::CLIENT_SEND_PREFIX.to_ascii_lowercase().as_str())
                 .or_else(|| trimmed.strip_prefix(consts::CLIENT_SEND_PREFIX))
             {
-                let cmd = format!("{}{}\n", consts::CLIENT_SEND_PREFIX, msg);
-                if let Err(e) = writer.write_all(cmd.as_bytes()).await {
+                let send_msg = ClientMessage::Send {
+                    message: msg.to_string(),
+                };
+                let encoded = send_msg.encode();
+                if let Err(e) = writer.write_all(&encoded).await {
                     eprintln!("Failed to send: {e}");
                     break;
                 }
+                let _ = writer.write_all(b"\n").await;
                 let _ = writer.flush().await;
             } else {
                 println!("Unknown command. Use 'send <message>' or 'leave'.");
             }
         }
-
         self.shutdown.store(true, Ordering::SeqCst);
         let _ = reader_handle.await;
         let _ = readline_handle.join();
-
         Ok(())
     }
 }
 
-async fn read_server_messages(mut reader: BufReader<tokio::net::tcp::OwnedReadHalf>, shutdown: Arc<AtomicBool>) {
+async fn read_server_messages(
+    username: &str,
+    mut reader: BufReader<tokio::net::tcp::OwnedReadHalf>,
+    shutdown: Arc<AtomicBool>,
+) {
     let mut line = String::new();
     loop {
         line.clear();
@@ -186,7 +203,7 @@ async fn read_server_messages(mut reader: BufReader<tokio::net::tcp::OwnedReadHa
                 shutdown.store(true, Ordering::SeqCst);
                 break;
             }
-            Ok(_) => handle_server_message(&line),
+            Ok(_) => parse_server_message(username, &line),
             Err(e) => {
                 eprintln!("\nRead error: {e}");
                 shutdown.store(true, Ordering::SeqCst);
@@ -196,8 +213,9 @@ async fn read_server_messages(mut reader: BufReader<tokio::net::tcp::OwnedReadHa
     }
 }
 
-fn read_user_input(cmd_tx: &mpsc::Sender<String>, shutdown: &Arc<AtomicBool>) {
+fn read_joined_user_input(cmd_tx: &mpsc::Sender<String>, shutdown: &Arc<AtomicBool>) {
     let Ok(mut rl) = DefaultEditor::new() else {
+        error!("unable to create DefaultEditor");
         return;
     };
 
@@ -205,51 +223,64 @@ fn read_user_input(cmd_tx: &mpsc::Sender<String>, shutdown: &Arc<AtomicBool>) {
         if shutdown.load(Ordering::SeqCst) {
             break;
         }
-
         match rl.readline("> ") {
             Ok(line) => {
                 let user_input = line.trim();
                 if user_input.is_empty() {
                     continue;
                 }
-
-                let _ = rl.add_history_entry(user_input);
-                if user_input.eq_ignore_ascii_case(consts::CLIENT_LEAVE_CMD) {
-                    let _ = cmd_tx.blocking_send(consts::CLIENT_LEAVE_CMD.to_string());
-                    break;
-                }
                 if cmd_tx.blocking_send(user_input.to_string()).is_err() {
                     break;
                 }
+                // add to history, only success cmds
+                let _ = rl.add_history_entry(user_input).map_err(|_| {
+                    info!("unable to add to history {}", user_input);
+                });
             }
             Err(ReadlineError::Interrupted | ReadlineError::Eof) => {
-                let _ = cmd_tx.blocking_send(consts::CLIENT_LEAVE_CMD.to_string());
+                if cmd_tx.blocking_send("leave".to_string()).is_err() {
+                    break;
+                }
                 break;
             }
-            Err(_) => break,
+            Err(e) => {
+                warn!("line error {}", e.to_string());
+                break;
+            }
         }
     }
 }
 
-fn handle_server_message(line: &str) {
+/// Parse server message using new wire protocol
+fn parse_server_message(this_user: &str, line: &str) {
     let trimmed = line.trim();
-    if sz::find(trimmed, consts::SERVER_BROADCAST_PREFIX) == Some(0) {
-        let rest = trimmed.get(consts::SERVER_BROADCAST_PREFIX.len()..).unwrap_or("");
-        if let Some(idx) = sz::find(rest, ":") {
-            let from = rest.get(..idx).unwrap_or("?");
-            let text = rest.get(idx.saturating_add(1)..).unwrap_or("");
-            println!("\r[{from}]: {text}");
-        } else {
-            println!("\r{trimmed}");
+    match ServerMessage::decode(trimmed.as_bytes()) {
+        Ok(ServerMessage::Ok) => {
+            // Silent acknowledgment
         }
-    } else if sz::find(trimmed, consts::SERVER_JOINED_PREFIX) == Some(0) {
-        let user = trimmed.get(consts::SERVER_JOINED_PREFIX.len()..).unwrap_or("?");
-        println!("\r*** {user} joined the chat ***");
-    } else if sz::find(trimmed, consts::SERVER_LEFT_PREFIX) == Some(0) {
-        let user = trimmed.get(consts::SERVER_LEFT_PREFIX.len()..).unwrap_or("?");
-        println!("\r*** {user} left the chat ***");
-    } else if trimmed != "OK" {
-        println!("\r{trimmed}");
+        Ok(ServerMessage::Err { reason }) => {
+            println!("\r[ERROR]: {reason}");
+        }
+        Ok(ServerMessage::UserJoined { username }) => {
+            if username != this_user {
+                println!("\r*** {username} joined the chat ***");
+            }
+        }
+        Ok(ServerMessage::UserLeft { username }) => {
+            if username != this_user {
+                println!("\r*** {username} left the chat ***");
+            }
+        }
+        Ok(ServerMessage::Broadcast { username, message }) => {
+            if username != this_user {
+                println!("\r[{username}]: {message}");
+            }
+        }
+        Err(_) => {
+            if !trimmed.is_empty() {
+                println!("\r{trimmed}");
+            }
+        }
     }
 }
 

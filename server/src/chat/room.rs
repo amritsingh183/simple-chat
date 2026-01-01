@@ -1,6 +1,6 @@
 use std::{
     fmt::{Display, Formatter},
-    sync::{LazyLock, RwLock, RwLockReadGuard, TryLockError},
+    sync::{Arc, LazyLock, RwLock, RwLockReadGuard, TryLockError},
     time::Duration,
 };
 
@@ -13,20 +13,20 @@ const DEFAULT_BUFFER_LENGTH: u16 = u16::MAX;
 
 #[derive(this_error, Debug)]
 pub enum Error {
-    #[error("room busy, message not sent: {0}")]
-    Busy(String),
+    #[error("room busy, message not sent")]
+    Busy,
 
-    #[error("room closed, message not sent: {0}")]
-    Closed(String),
+    #[error("room closed, message not sent")]
+    Closed,
 
-    #[error("room buffer full, message not sent: {0}")]
-    Full(String),
+    #[error("room buffer full, message not sent")]
+    Full,
 
-    #[error("room send timed out, message not sent: {0}")]
-    Timeout(String),
+    #[error("room send timed out, message not sent")]
+    Timeout,
 
-    #[error("room lock poisoned, message not sent: {0}")]
-    Poisoned(String),
+    #[error("room lock poisoned, message not sent")]
+    Poisoned,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,44 +35,73 @@ pub enum RecvError {
     Disconnected,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OneToOne(pub Vec<u8>); // Source of message need not fanout(user->room)
+
+#[derive(Debug, Clone)]
+pub struct OneToMany(Arc<Vec<u8>>); // Source of message need fanout(room->to all users)
+
+impl From<Vec<u8>> for OneToOne {
+    fn from(v: Vec<u8>) -> Self {
+        Self(v)
+    }
+}
+
+impl From<OneToOne> for OneToMany {
+    fn from(one: OneToOne) -> Self {
+        Self(Arc::new(one.0))
+    }
+}
+impl std::ops::Deref for OneToOne {
+    type Target = [u8];
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for OneToMany {
+    type Target = [u8];
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 pub trait MessageReceiver: Send + Sync {
-    fn recv_timeout(&self, timeout: Duration) -> Result<String, RecvError>;
+    fn recv_timeout(&self, timeout: Duration) -> Result<OneToMany, RecvError>;
 }
 
-pub trait MessageQueue: Send + Sync {
-    fn send_timeout(&self, msg: String, timeout: Duration) -> Result<(), Error>;
-    fn receiver(&self) -> &dyn MessageReceiver;
-}
-
-impl MessageReceiver for Receiver<String> {
-    fn recv_timeout(&self, timeout: Duration) -> Result<String, RecvError> {
+impl MessageReceiver for Receiver<OneToMany> {
+    fn recv_timeout(&self, timeout: Duration) -> Result<OneToMany, RecvError> {
         Self::recv_timeout(self, timeout).map_err(|e| match e {
             crossbeam::channel::RecvTimeoutError::Timeout => RecvError::Timeout,
             crossbeam::channel::RecvTimeoutError::Disconnected => RecvError::Disconnected,
         })
     }
 }
-
+pub trait MessageQueue: Send + Sync {
+    fn send_timeout(&self, msg: OneToOne, timeout: Duration) -> Result<(), Error>;
+    fn receiver(&self) -> &dyn MessageReceiver;
+}
 static ROOM: LazyLock<Room> = LazyLock::new(|| Room::new(DEFAULT_BUFFER_LENGTH));
 
 pub fn get_room() -> &'static dyn MessageQueue {
     &*ROOM
 }
 
-impl From<TrySendError<String>> for Error {
-    fn from(err: TrySendError<String>) -> Self {
+impl From<TrySendError<OneToMany>> for Error {
+    fn from(err: TrySendError<OneToMany>) -> Self {
         match err {
-            TrySendError::Full(m) => Self::Full(m),
-            TrySendError::Disconnected(m) => Self::Closed(m),
+            TrySendError::Full(_) => Self::Full,
+            TrySendError::Disconnected(_) => Self::Closed,
         }
     }
 }
 
-impl From<SendTimeoutError<String>> for Error {
-    fn from(err: SendTimeoutError<String>) -> Self {
+impl From<SendTimeoutError<OneToMany>> for Error {
+    fn from(err: SendTimeoutError<OneToMany>) -> Self {
         match err {
-            SendTimeoutError::Timeout(m) => Self::Timeout(m),
-            SendTimeoutError::Disconnected(m) => Self::Closed(m),
+            SendTimeoutError::Timeout(_) => Self::Timeout,
+            SendTimeoutError::Disconnected(_) => Self::Closed,
         }
     }
 }
@@ -82,8 +111,8 @@ pub struct Room {
     id: Uuid,
     created_at: Timestamp,
 
-    sender: RwLock<Option<Sender<String>>>,
-    receiver: Receiver<String>,
+    sender: RwLock<Option<Sender<OneToMany>>>,
+    receiver: Receiver<OneToMany>, // we need fanout 1:n
 }
 
 impl Display for Room {
@@ -104,29 +133,30 @@ impl Room {
         }
     }
 
-    fn with_sender<F, E>(&self, msg: String, f: F) -> Result<(), Error>
+    fn with_sender<F, E>(&self, msg: OneToMany, f: F) -> Result<(), Error>
     where
-        F: FnOnce(&Sender<String>, String) -> Result<(), E>,
+        F: FnOnce(&Sender<OneToMany>, OneToMany) -> Result<(), E>,
         E: Into<Error>,
     {
-        let guard: RwLockReadGuard<'_, Option<Sender<String>>> = self.sender.try_read().map_err(|e| match e {
-            TryLockError::WouldBlock => Error::Busy(msg.clone()),
-            TryLockError::Poisoned(_) => Error::Poisoned(msg.clone()),
+        let guard: RwLockReadGuard<'_, Option<Sender<OneToMany>>> = self.sender.try_read().map_err(|e| match e {
+            TryLockError::WouldBlock => Error::Busy,
+            TryLockError::Poisoned(_) => Error::Poisoned,
         })?;
-        let sender: &Sender<String> = guard.as_ref().ok_or_else(|| Error::Closed(msg.clone()))?;
+        let sender: &Sender<OneToMany> = guard.as_ref().ok_or(Error::Closed)?;
         let result = f(sender, msg);
         drop(guard);
         result.map_err(Into::into)
     }
 
-    fn send_timeout_impl(&self, msg: String, timeout: Duration) -> Result<(), Error> {
+    fn send_timeout(&self, msg: OneToMany, timeout: Duration) -> Result<(), Error> {
         self.with_sender(msg, |sender, m| sender.send_timeout(m, timeout))
     }
 }
 
 impl MessageQueue for Room {
-    fn send_timeout(&self, msg: String, timeout: Duration) -> Result<(), Error> {
-        self.send_timeout_impl(msg, timeout)
+    // also converts OneToOne->OneToMany
+    fn send_timeout(&self, msg: OneToOne, timeout: Duration) -> Result<(), Error> {
+        self.send_timeout(msg.into(), timeout)
     }
 
     fn receiver(&self) -> &dyn MessageReceiver {
@@ -145,7 +175,7 @@ mod tests {
     fn test_room_new_enforces_minimum_buffer() {
         let room = Room::new(0);
         // Should be able to send at least one message (buffer is 1, not 0)
-        let result = room.send_timeout("test".to_string(), Duration::from_millis(100));
+        let result = MessageQueue::send_timeout(&room, OneToOne::from(b"test".to_vec()), Duration::from_millis(100));
         assert!(result.is_ok());
     }
 
@@ -154,7 +184,11 @@ mod tests {
         let room = Room::new(5);
         // Should be able to send 5 messages without blocking
         for i in 0..5 {
-            let result = room.send_timeout(format!("msg{i}"), Duration::from_millis(100));
+            let result = MessageQueue::send_timeout(
+                &room,
+                OneToOne::from(format!("msg{i}").into_bytes()),
+                Duration::from_millis(100),
+            );
             assert!(result.is_ok());
         }
     }
@@ -162,11 +196,11 @@ mod tests {
     #[test]
     fn test_room_send_and_receive() {
         let room = Room::new(10);
-        let msg = "hello".to_string();
-        room.send_timeout(msg.clone(), Duration::from_millis(100)).unwrap();
+        let msg = b"hello".to_vec();
+        MessageQueue::send_timeout(&room, OneToOne::from(msg.clone()), Duration::from_millis(100)).unwrap();
 
         let received = room.receiver().recv_timeout(Duration::from_millis(100)).unwrap();
-        assert_eq!(received, msg);
+        assert_eq!(&*received, msg.as_slice());
     }
 
     #[test]
@@ -180,44 +214,44 @@ mod tests {
 
     #[test]
     fn test_error_from_try_send_full() {
-        let err = TrySendError::Full("test_msg".to_string());
+        let err = TrySendError::Full(OneToMany::from(OneToOne::from(b"test_msg".to_vec())));
         let room_err: Error = err.into();
-        assert!(matches!(room_err, Error::Full(m) if m == "test_msg"));
+        assert!(matches!(room_err, Error::Full));
     }
 
     #[test]
     fn test_error_from_try_send_disconnected() {
-        let err = TrySendError::Disconnected("test_msg".to_string());
+        let err = TrySendError::Disconnected(OneToMany::from(OneToOne::from(b"test_msg".to_vec())));
         let room_err: Error = err.into();
-        assert!(matches!(room_err, Error::Closed(m) if m == "test_msg"));
+        assert!(matches!(room_err, Error::Closed));
     }
 
     #[test]
     fn test_error_from_send_timeout_timeout() {
-        let err = SendTimeoutError::Timeout("test_msg".to_string());
+        let err = SendTimeoutError::Timeout(OneToMany::from(OneToOne::from(b"test_msg".to_vec())));
         let room_err: Error = err.into();
-        assert!(matches!(room_err, Error::Timeout(m) if m == "test_msg"));
+        assert!(matches!(room_err, Error::Timeout));
     }
 
     #[test]
     fn test_error_from_send_timeout_disconnected() {
-        let err = SendTimeoutError::Disconnected("test_msg".to_string());
+        let err = SendTimeoutError::Disconnected(OneToMany::from(OneToOne::from(b"test_msg".to_vec())));
         let room_err: Error = err.into();
-        assert!(matches!(room_err, Error::Closed(m) if m == "test_msg"));
+        assert!(matches!(room_err, Error::Closed));
     }
 
     #[test]
     fn test_error_display() {
-        let busy = Error::Busy("msg".to_string());
+        let busy = Error::Busy;
         assert!(busy.to_string().contains("busy"));
 
-        let closed = Error::Closed("msg".to_string());
+        let closed = Error::Closed;
         assert!(closed.to_string().contains("closed"));
 
-        let full = Error::Full("msg".to_string());
+        let full = Error::Full;
         assert!(full.to_string().contains("full"));
 
-        let timeout = Error::Timeout("msg".to_string());
+        let timeout = Error::Timeout;
         assert!(timeout.to_string().contains("timed out"));
     }
 }

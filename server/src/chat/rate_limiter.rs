@@ -1,6 +1,6 @@
 use std::num::NonZeroU32;
 
-use common::security::{MAX_MESSAGES_PER_SECOND, MESSAGE_BURST_CAPACITY};
+use common::consts::{MAX_MESSAGES_PER_SECOND, MESSAGE_BURST_CAPACITY};
 use governor::{
     Quota, RateLimiter as GovRateLimiter,
     clock::DefaultClock,

@@ -1,0 +1,47 @@
+syntax = "proto3";
+package chat;
+
+// Bidirectional streaming chat service
+service ChatService {
+  // Single bidirectional stream for the entire chat session
+  rpc ChatStream(stream ClientMessage) returns (stream ServerMessage);
+}
+
+// Client-to-server messages
+message ClientMessage {
+  oneof command {
+    JoinRequest join = 1;
+    SendRequest send = 2;
+    LeaveRequest leave = 3;
+  }
+}
+
+message JoinRequest { string username = 1; }
+
+message SendRequest { string message = 1; }
+
+message LeaveRequest {}
+
+// Server-to-client messages
+message ServerMessage {
+  oneof response {
+    OkResponse ok = 1;
+    ErrorResponse error = 2;
+    UserJoinedEvent user_joined = 3;
+    UserLeftEvent user_left = 4;
+    BroadcastEvent broadcast = 5;
+  }
+}
+
+message OkResponse {}
+
+message ErrorResponse { string reason = 1; }
+
+message UserJoinedEvent { string username = 1; }
+
+message UserLeftEvent { string username = 1; }
+
+message BroadcastEvent {
+  string from_user = 1;
+  string text = 2;
+}

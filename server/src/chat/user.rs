@@ -5,16 +5,18 @@ use std::{
     time::Duration,
 };
 
-use crossbeam::channel::{SendTimeoutError, Sender};
+use futures::stream::{self, StreamExt};
 use parking_lot::RwLock;
 use stringzilla::sz;
 use thiserror::Error as this_error;
-use tracing::warn;
+use tokio::sync::mpsc::Sender;
 
 use super::string::{self as my_string, ValidationResult};
+use crate::chat::room;
 
 const SEND_TIMEOUT: Duration = Duration::from_millis(100);
 const LOCK_TIMEOUT: Duration = Duration::from_millis(50);
+const CONCURRENT_LIMIT: usize = 1024;
 
 static REGISTRY: LazyLock<UserRegistry> = LazyLock::new(UserRegistry::new);
 
@@ -38,12 +40,6 @@ pub enum Error {
 
     #[error("registry lock timeout")]
     LockTimeout,
-
-    #[error("user '{0}' channel is full")]
-    ChannelFull(String),
-
-    #[error("user '{0}' disconnected")]
-    Disconnected(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -72,7 +68,7 @@ impl Display for Username {
 #[derive(Debug, Clone)]
 pub struct User {
     username: Username,
-    tx: Sender<String>,
+    tx: Sender<room::OneToMany>,
 }
 impl Display for User {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -80,17 +76,11 @@ impl Display for User {
     }
 }
 impl User {
-    const fn new(username: Username, tx: Sender<String>) -> Self {
+    const fn new(username: Username, tx: Sender<room::OneToMany>) -> Self {
         Self { username, tx }
     }
     pub fn get_username(&self) -> Username {
         self.username.clone()
-    }
-    pub fn send_timeout(&self, message: &str, timeout: Duration) -> Result<(), Error> {
-        self.tx.send_timeout(message.to_string(), timeout).map_err(|e| match e {
-            SendTimeoutError::Timeout(_) => Error::ChannelFull(self.username.to_string()),
-            SendTimeoutError::Disconnected(_) => Error::Disconnected(self.username.to_string()),
-        })
     }
 }
 
@@ -115,7 +105,7 @@ impl UserRegistry {
         }
     }
 
-    pub fn register(&self, username: &Username, tx: Sender<String>) -> Result<User, Error> {
+    pub fn register(&self, username: &Username, tx: Sender<room::OneToMany>) -> Result<User, Error> {
         match self
             .users
             .try_write_for(LOCK_TIMEOUT)
@@ -139,28 +129,39 @@ impl UserRegistry {
             .is_some())
     }
 
-    pub fn broadcast(&self, message: &str, exclude: Option<&Username>) -> Result<usize, Error> {
-        Ok(self
-            .users
-            .try_read_for(LOCK_TIMEOUT)
-            .ok_or(Error::LockTimeout)?
-            .values()
-            .filter(|user| !exclude.is_some_and(|excluded| excluded == &user.username))
-            .filter_map(|user| {
-                user.send_timeout(message, SEND_TIMEOUT)
-                    .inspect_err(|e| {
-                        warn!(%e, username = %user.username, "broadcast send failed");
-                    })
-                    .ok()
+    pub async fn broadcast(&self, message: &room::OneToMany, exclude: Option<&Username>) -> Result<usize, Error> {
+        let senders: Vec<_> = {
+            let guard = self.users.try_read_for(LOCK_TIMEOUT).ok_or(Error::LockTimeout)?;
+            guard
+                .values()
+                .filter(|user| exclude != Some(&user.username))
+                .map(|user| user.tx.clone())
+                .collect()
+        };
+
+        // Stream with bounded concurrency - max CONCURRENT_LIMIT in-flight
+        let sent_count = stream::iter(senders)
+            .map(|tx| {
+                let msg = message.clone();
+                async move {
+                    tokio::time::timeout(SEND_TIMEOUT, tx.send(msg))
+                        .await
+                        .is_ok_and(|r| r.is_ok())
+                }
             })
-            .count())
+            .buffer_unordered(CONCURRENT_LIMIT)
+            .filter(|&success| async move { success })
+            .count()
+            .await;
+
+        Ok(sent_count)
     }
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use crossbeam::channel;
+    use tokio::sync::mpsc;
 
     use super::*;
 
@@ -204,7 +205,7 @@ mod tests {
     #[test]
     fn test_registry_register_success() {
         let registry = UserRegistry::new();
-        let (tx, _rx) = channel::unbounded();
+        let (tx, _rx) = mpsc::channel(256);
         let username = Username::new("alice").unwrap();
 
         let result = registry.register(&username, tx);
@@ -215,8 +216,8 @@ mod tests {
     #[test]
     fn test_registry_duplicate_detection() {
         let registry = UserRegistry::new();
-        let (tx1, _rx1) = channel::unbounded();
-        let (tx2, _rx2) = channel::unbounded();
+        let (tx1, _rx1) = mpsc::channel(256);
+        let (tx2, _rx2) = mpsc::channel(256);
         let username = Username::new("bob").unwrap();
 
         assert!(registry.register(&username, tx1).is_ok());
@@ -227,8 +228,8 @@ mod tests {
     #[test]
     fn test_registry_case_insensitive_duplicate() {
         let registry = UserRegistry::new();
-        let (tx1, _rx1) = channel::unbounded();
-        let (tx2, _rx2) = channel::unbounded();
+        let (tx1, _rx1) = mpsc::channel(256);
+        let (tx2, _rx2) = mpsc::channel(256);
 
         let alice_lower = Username::new("alice").unwrap();
         let alice_upper = Username::new("ALICE").unwrap();
@@ -241,7 +242,7 @@ mod tests {
     #[test]
     fn test_registry_unregister() {
         let registry = UserRegistry::new();
-        let (tx, _rx) = channel::unbounded();
+        let (tx, _rx) = mpsc::channel(256);
         let username = Username::new("charlie").unwrap();
 
         let user = registry.register(&username, tx).unwrap();
@@ -253,8 +254,8 @@ mod tests {
     #[test]
     fn test_registry_reregister_after_unregister() {
         let registry = UserRegistry::new();
-        let (tx1, _rx1) = channel::unbounded();
-        let (tx2, _rx2) = channel::unbounded();
+        let (tx1, _rx1) = mpsc::channel(256);
+        let (tx2, _rx2) = mpsc::channel(256);
         let username = Username::new("dave").unwrap();
 
         let user = registry.register(&username, tx1).unwrap();
@@ -265,7 +266,7 @@ mod tests {
 
     #[test]
     fn test_user_display() {
-        let (tx, _rx) = channel::unbounded();
+        let (tx, _rx) = mpsc::channel(256);
         let username = Username::new("echo").unwrap();
         let user = User::new(username, tx);
         assert_eq!(format!("{user}"), "echo");

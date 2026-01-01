@@ -25,6 +25,7 @@ tokio.workspace = true
 thiserror.workspace = true
 stringzilla.workspace = true
 governor = "0.10.4"
+futures = "0.3.31"
 
 [build-dependencies]
 

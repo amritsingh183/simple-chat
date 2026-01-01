@@ -1,9 +1,6 @@
 pub mod broker;
-pub mod client_protocol;
 pub mod connection;
-pub mod message;
 pub mod rate_limiter;
 pub mod room;
-pub mod server_protocol;
 pub mod string;
 pub mod user;

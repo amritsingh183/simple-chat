@@ -1,11 +1,6 @@
 use std::{env, fmt};
 
-pub const APP_ENV: &str = "CHAT_APP_ENV";
-pub const DEFAULT_TZ: &str = "Etc/UTC";
-pub const APP_ENV_DEFAULT_VALUE: &str = "development";
-pub const APP_ENV_PROD_VALUE: &str = "production";
-pub const DEFAULT_LOG_LEVEL: &str = "CHAT_APP_LOG_LEVEL";
-pub const DEFAULT_LOG_LEVEL_DEFAULT_VALUE: &str = "info";
+use crate::consts;
 
 /// Returns the server timezone from the `TZ` environment variable.
 ///
@@ -13,7 +8,7 @@ pub const DEFAULT_LOG_LEVEL_DEFAULT_VALUE: &str = "info";
 ///
 /// Returns an error if the `TZ` environment variable is not set.
 #[must_use = "Server must use same timezone everywhere"]
-pub fn get_server_tz() -> Result<String, String> {
+pub fn server_tz() -> Result<String, String> {
     env::var("TZ").map_err(|_| "TZ must be set".to_string())
 }
 
@@ -37,7 +32,7 @@ impl std::error::Error for InvalidLogLevelError {}
 
 #[must_use]
 pub fn app_env() -> String {
-    env::var(APP_ENV).unwrap_or_else(|_| APP_ENV_DEFAULT_VALUE.to_owned())
+    env::var(consts::APP_ENV).unwrap_or_else(|_| consts::APP_ENV_DEFAULT_VALUE.to_owned())
 }
 
 /// Returns the configured log level.
@@ -46,9 +41,9 @@ pub fn app_env() -> String {
 ///
 /// Returns an error if the log level is not one of: trace, debug, info, warn, error, off.
 pub fn log_level() -> Result<String, InvalidLogLevelError> {
-    let level = env::var(DEFAULT_LOG_LEVEL)
+    let level = env::var(consts::DEFAULT_LOG_LEVEL)
         .or_else(|_| env::var("RUST_LOG"))
-        .unwrap_or_else(|_| DEFAULT_LOG_LEVEL_DEFAULT_VALUE.to_owned());
+        .unwrap_or_else(|_| consts::DEFAULT_LOG_LEVEL_DEFAULT_VALUE.to_owned());
 
     // Validate it's a known log level
     match level.to_lowercase().as_str() {
@@ -59,5 +54,5 @@ pub fn log_level() -> Result<String, InvalidLogLevelError> {
 
 #[must_use]
 pub fn is_production() -> bool {
-    app_env() == APP_ENV_PROD_VALUE
+    app_env() == consts::APP_ENV_PROD_VALUE
 }

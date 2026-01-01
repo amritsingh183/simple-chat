@@ -3,32 +3,14 @@
 //! Provides functions for sanitizing user input before logging,
 //! and security-related constants.
 
-use std::time::Duration;
-
-/// Maximum allowed message length in bytes.
-pub const MAX_MESSAGE_LENGTH: usize = 4096;
-
-/// Maximum allowed line length when reading from socket.
-pub const MAX_LINE_LENGTH: usize = 4096;
-
-/// Read timeout for socket operations.
-pub const READ_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Maximum concurrent connections the server will accept.
-pub const MAX_CONNECTIONS: usize = 10_000;
-
-/// Rate limit: maximum messages per second per user.
-pub const MAX_MESSAGES_PER_SECOND: u32 = 10;
-
-/// Rate limit: burst capacity for message rate limiting.
-pub const MESSAGE_BURST_CAPACITY: u32 = 20;
-
 /// Sanitizes a string for safe logging by escaping control characters.
 ///
 /// This prevents log injection attacks where malicious input could:
 /// - Forge log entries by injecting newlines
 /// - Corrupt log files with control characters
 /// - Bypass log analysis tools
+///
+/// ANSI escape sequences (for terminal colors) are preserved.
 ///
 /// # Examples
 ///
@@ -37,23 +19,51 @@ pub const MESSAGE_BURST_CAPACITY: u32 = 20;
 ///
 /// assert_eq!(sanitize_for_log("normal"), "normal");
 /// assert_eq!(sanitize_for_log("line1\nline2"), "line1\\nline2");
-/// assert_eq!(sanitize_for_log("with\r\nCRLF"), "with\\r\\nCRLF");
+/// // ANSI colors are preserved
+/// assert_eq!(sanitize_for_log("\x1b[32mgreen\x1b[0m"), "\x1b[32mgreen\x1b[0m");
 /// ```
 #[must_use]
 pub fn sanitize_for_log(s: &str) -> String {
-    use std::fmt::Write;
-
     let mut result = String::with_capacity(s.len());
-    for c in s.chars() {
+    let mut chars = s.chars().peekable();
+
+    while let Some(c) = chars.next() {
         match c {
+            // Check for ANSI escape sequence start
+            '\x1b' => {
+                result.push(c);
+                // If followed by '[', it's an ANSI CSI sequence - pass it through
+                if chars.peek() == Some(&'[') {
+                    if let Some(bracket) = chars.next() {
+                        result.push(bracket);
+                    }
+                    // Consume until we hit the terminating letter (@ through ~)
+                    loop {
+                        match chars.peek() {
+                            Some(&next) if next.is_ascii_alphabetic() || next == '~' || next == '@' => {
+                                if let Some(term) = chars.next() {
+                                    result.push(term);
+                                }
+                                break;
+                            }
+                            Some(_) => {
+                                if let Some(ch) = chars.next() {
+                                    result.push(ch);
+                                }
+                            }
+                            None => break,
+                        }
+                    }
+                }
+            }
             '\n' => result.push_str("\\n"),
             '\r' => result.push_str("\\r"),
             '\t' => result.push_str("\\t"),
             '\0' => result.push_str("\\0"),
-            // Escape other control characters as hex
+            // Escape other control characters as hex (but not ANSI which we handled above)
             c if c.is_control() => {
+                use std::fmt::Write;
                 for byte in c.to_string().bytes() {
-                    // Use write! to avoid extra allocation from format!
                     let _ = write!(result, "\\x{byte:02x}");
                 }
             }
