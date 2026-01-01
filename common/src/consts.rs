@@ -41,7 +41,7 @@ pub const DEFAULT_LOG_LEVEL_DEFAULT_VALUE: &str = "info";
 pub const MAX_LOG_LINE_LENGTH: usize = 1024;
 pub const CHECK_INTERVAL_TCP_READER: Duration = Duration::from_millis(600);
 
-pub const MAX_CLIENT_BUFFER_SIZE: usize = 10;
+pub const MAX_CLIENT_BUFFER_SIZE: usize = 1024;
 
 pub const MAX_CLIENT_MESSAGE_LENGTH: usize = 4096;
 
