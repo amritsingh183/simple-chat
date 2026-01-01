@@ -1,0 +1,22 @@
+[package]
+name = "client"
+description = "Chat client CLI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "client"
+path = "src/main.rs"
+
+[dependencies]
+common.workspace = true
+tokio.workspace = true
+clap.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+rustyline.workspace = true
+stringzilla.workspace = true
+
+[lints]
+workspace = true

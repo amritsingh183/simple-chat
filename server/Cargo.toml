@@ -1,0 +1,33 @@
+[package]
+name = "server"
+description = "Chat server binary"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "server"
+path = "src/main.rs"
+
+[dependencies]
+common.workspace = true
+
+tracing.workspace = true
+tracing-appender.workspace = true
+tracing-subscriber.workspace = true
+tracing-log.workspace = true
+crossbeam-channel.workspace = true
+uuid.workspace = true
+jiff = "0.2.17"
+crossbeam = "0.8.4"
+parking_lot = "0.12"
+tokio.workspace = true
+thiserror.workspace = true
+stringzilla.workspace = true
+governor = "0.10.4"
+futures = "0.3.31"
+
+[build-dependencies]
+
+[lints]
+workspace = true
